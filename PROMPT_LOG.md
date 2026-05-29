@@ -397,3 +397,125 @@ func (w *Writer) flushBuffer() {
 
 	log.Printf("[INFO] flushed %d records → %s", len(batch), filename)
 }
+
+Шаг 5 — Go-сборщик: main.go
+
+Промпт: Напиши Go-файл main.go — точка входа конвейера мониторинга очередей МФЦ.
+
+Требования:
+- Связать компоненты в цепочку: Emulator → rawCh → Aggregator → aggCh → Writer
+- Каждый компонент запускать в отдельной горутине через go func()
+- Graceful shutdown: слушать os.Signal (SIGINT, SIGTERM) через отдельную горутину, при получении сигнала закрыть канал done — это останавливает все компоненты
+- При завершении Writer должен сбросить буфер (дописать незаконченный файл)
+- Вынести все настройки в константы вверху файла: numWindows=8, emitInterval=2s, windowDur=30s, batchSize=20,
+flushInterval=15s, outputDir="../data"
+- Функцию runAggregator вынести отдельно: читает из rawCh, каждые 5 сек вызывает Aggregator.Flush(), при завершении делает финальный flush всех незакрытых окон и закрывает aggCh
+- Логировать все ключевые события: старт, каждый flush окна, graceful shutdown, остановку
+- Использовать только стандартную библиотеку Go: log, os, os/signal, syscall, time.
+
+Результат: файл main.go — константы, функция main() с инициализацией
+всех компонентов и горутин, функция runAggregator() с ticker для периодического
+flush и финальным flush при завершении.
+
+main.go:
+package main
+
+import (
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+const (
+	numWindows    = 8
+	emitInterval  = 2 * time.Second
+	windowDur     = 30 * time.Second
+	batchSize     = 20
+	flushInterval = 15 * time.Second
+	outputDir     = "../data"
+)
+
+func main() {
+	log.SetFlags(log.Ldate | log.Ltime)
+	log.Println("[INFO] MFC collector starting")
+	log.Printf("[INFO] windows=%d, emit_interval=%s, tumbling_window=%s",
+		numWindows, emitInterval, windowDur)
+
+	// Graceful shutdown: listen for SIGINT / SIGTERM.
+	done := make(chan struct{})
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigCh
+		log.Printf("[INFO] received signal %s — shutting down gracefully", sig)
+		close(done)
+	}()
+
+	// Raw records channel (buffered to absorb bursts).
+	rawCh := make(chan QueueRecord, numWindows*10)
+
+	// Aggregated records channel.
+	aggCh := make(chan AggregatedRecord, 200)
+
+	// Start emulator.
+	emulator := NewEmulator(numWindows, emitInterval)
+	go emulator.Run(rawCh, done)
+	log.Printf("[INFO] emulator started: %d windows", numWindows)
+
+	// Start aggregator loop.
+	aggregator := NewAggregator(windowDur)
+	go runAggregator(aggregator, rawCh, aggCh, done)
+	log.Printf("[INFO] aggregator started: window=%s", windowDur)
+
+	// Start writer.
+	writer, err := NewWriter(outputDir, batchSize, flushInterval)
+	if err != nil {
+		log.Fatalf("[FATAL] writer init: %v", err)
+	}
+	log.Printf("[INFO] writer started: batch=%d, flush_interval=%s, output=%s",
+		batchSize, flushInterval, outputDir)
+
+	// Writer runs in the main goroutine and blocks until done.
+	writer.Run(aggCh, done)
+
+	log.Println("[INFO] MFC collector stopped")
+}
+
+// runAggregator reads raw records, feeds them into the aggregator,
+// and periodically flushes completed windows into aggCh.
+func runAggregator(agg *Aggregator, in <-chan QueueRecord, out chan<- AggregatedRecord, done <-chan struct{}) {
+	flushTicker := time.NewTicker(5 * time.Second)
+	defer func() {
+		flushTicker.Stop()
+		// Final flush before exit.
+		for _, rec := range agg.Flush(time.Now().Add(windowDur)) {
+			out <- rec
+		}
+		close(out)
+		log.Println("[INFO] aggregator stopped")
+	}()
+
+	for {
+		select {
+		case rec, ok := <-in:
+			if !ok {
+				return
+			}
+			agg.Add(rec)
+
+		case t := <-flushTicker.C:
+			flushed := agg.Flush(t)
+			for _, rec := range flushed {
+				out <- rec
+				log.Printf("[INFO] window flushed: window_id=%d service=%s avg_queue=%.1f samples=%d",
+					rec.WindowID, rec.ServiceType, rec.AvgQueueLength, rec.SampleCount)
+			}
+
+		case <-done:
+			return
+		}
+	}
+}
