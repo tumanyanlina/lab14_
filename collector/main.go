@@ -56,9 +56,10 @@ func main() {
 	// Raw records channel (buffered to absorb bursts).
 	rawCh := make(chan QueueRecord, numWindows*10)
 
-	// Aggregated records channels — fan-out to Writer and ArrowWriter.
+	// Aggregated records channels — fan-out to all writers.
 	aggCh := make(chan AggregatedRecord, 200)
 	aggChArrow := make(chan AggregatedRecord, 200)
+	aggChNats := make(chan AggregatedRecord, 200)
 
 	// Start emulator.
 	emulator := NewEmulator(numWindows, emitInterval)
@@ -70,12 +71,14 @@ func main() {
 	go runAggregator(aggregator, rawCh, aggCh, done)
 	log.Printf("[INFO] aggregator started: window=%s", windowDur)
 
-	// Fan-out: forward aggregated records to both writers.
+	// Fan-out: forward aggregated records to all writers.
 	go func() {
 		for rec := range aggCh {
 			aggChArrow <- rec
+			aggChNats <- rec
 		}
 		close(aggChArrow)
+		close(aggChNats)
 	}()
 
 	// Arrow writer.
@@ -85,6 +88,16 @@ func main() {
 	} else {
 		log.Printf("[INFO] arrow writer started: output=%s", outputDir)
 		go runArrowWriter(arrowWriter, aggChArrow, done)
+	}
+
+	// NATS writer.
+	natsWriter, natsErr := NewNatsWriter()
+	if natsErr != nil {
+		log.Printf("[WARN] nats unavailable, skipping: %v", natsErr)
+	} else {
+		defer natsWriter.Close()
+		log.Printf("[INFO] nats writer started: subject=%s", natsSubject)
+		go runNatsWriter(natsWriter, aggChNats, done)
 	}
 
 	// Start writer.
@@ -101,8 +114,6 @@ func main() {
 	log.Println("[INFO] MFC collector stopped")
 }
 
-// runAggregator reads raw records, feeds them into the aggregator,
-// and periodically flushes completed windows into aggCh.
 func runAggregator(agg *Aggregator, in <-chan QueueRecord, out chan<- AggregatedRecord, done <-chan struct{}) {
 	flushTicker := time.NewTicker(5 * time.Second)
 	defer func() {
@@ -121,7 +132,6 @@ func runAggregator(agg *Aggregator, in <-chan QueueRecord, out chan<- Aggregated
 				return
 			}
 			agg.Add(rec)
-
 		case t := <-flushTicker.C:
 			flushed := agg.Flush(t)
 			for _, rec := range flushed {
@@ -129,14 +139,12 @@ func runAggregator(agg *Aggregator, in <-chan QueueRecord, out chan<- Aggregated
 				log.Printf("[INFO] window flushed: window_id=%d service=%s avg_queue=%.1f samples=%d",
 					rec.WindowID, rec.ServiceType, rec.AvgQueueLength, rec.SampleCount)
 			}
-
 		case <-done:
 			return
 		}
 	}
 }
 
-// runArrowWriter buffers AggregatedRecords and writes them to Arrow IPC files.
 func runArrowWriter(aw *ArrowWriter, ch <-chan AggregatedRecord, done <-chan struct{}) {
 	var buf []AggregatedRecord
 	ticker := time.NewTicker(flushInterval)
@@ -148,6 +156,41 @@ func runArrowWriter(aw *ArrowWriter, ch <-chan AggregatedRecord, done <-chan str
 		}
 		if err := aw.WriteBatch(buf); err != nil {
 			log.Printf("[ERROR] arrow flush: %v", err)
+		}
+		buf = nil
+	}
+
+	for {
+		select {
+		case rec, ok := <-ch:
+			if !ok {
+				flush()
+				return
+			}
+			buf = append(buf, rec)
+			if len(buf) >= batchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		case <-done:
+			flush()
+			return
+		}
+	}
+}
+
+func runNatsWriter(nw *NatsWriter, ch <-chan AggregatedRecord, done <-chan struct{}) {
+	var buf []AggregatedRecord
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		if err := nw.Publish(buf); err != nil {
+			log.Printf("[ERROR] nats publish: %v", err)
 		}
 		buf = nil
 	}
