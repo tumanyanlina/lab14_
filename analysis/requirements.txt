@@ -3,5 +3,5 @@ duckdb==1.2.2
 plotly==5.22.0
 pandas==2.2.2
 streamlit==1.35.0
-kaleido==0.2.1
+kaleido==0.1.0.post1
 pyarrow==24.0.0
