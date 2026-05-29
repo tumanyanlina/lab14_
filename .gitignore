@@ -1,0 +1,27 @@
+# Go
+collector/collector.exe
+collector/*.exe
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Data files (generated)
+data/*.ndjson
+data/*.parquet
+
+# Plots (generated)
+analysis/plots/
+
+# Streamlit cache
+.streamlit/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
