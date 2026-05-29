@@ -1,6 +1,7 @@
 package main
 
 import (
+    "context"
 	"log"
 	"os"
 	"os/signal"
@@ -33,7 +34,23 @@ func main() {
 		log.Printf("[INFO] received signal %s — shutting down gracefully", sig)
 		close(done)
 	}()
-
+// Coordinator: register this instance in etcd.
+	instanceID := 1 // в реальной системе берётся из env: os.Getenv("INSTANCE_ID")
+	coord, err := NewCoordinator(instanceID)
+	if err != nil {
+		log.Printf("[WARN] etcd unavailable, running standalone: %v", err)
+	} else {
+		coordCtx, coordCancel := context.WithCancel(context.Background())
+		defer coordCancel()
+		assignedWindows := AssignShards(instanceID, 1, numWindows)
+		if err := coord.Register(coordCtx, instanceID, assignedWindows); err != nil {
+			log.Printf("[WARN] coordinator register failed: %v", err)
+		} else {
+			defer coord.Deregister(coordCtx)
+			instances, _ := coord.ListInstances(coordCtx)
+			log.Printf("[INFO] active instances: %v", instances)
+		}
+	}
 	// Raw records channel (buffered to absorb bursts).
 	rawCh := make(chan QueueRecord, numWindows*10)
 
