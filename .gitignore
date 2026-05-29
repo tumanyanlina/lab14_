@@ -27,3 +27,6 @@ analysis/plots/
 # OS
 .DS_Store
 Thumbs.db
+# Rust
+validator/target/
+validator/.venv/
