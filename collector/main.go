@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -37,13 +38,21 @@ func main() {
 
 	// Coordinator: register this instance in etcd.
 	instanceID := 1
+	numInstances := 1
+	if envID := os.Getenv("INSTANCE_ID"); envID != "" {
+		fmt.Sscanf(envID, "%d", &instanceID)
+	}
+	if envN := os.Getenv("NUM_INSTANCES"); envN != "" {
+		fmt.Sscanf(envN, "%d", &numInstances)
+	}
+
 	coord, err := NewCoordinator(instanceID)
 	if err != nil {
 		log.Printf("[WARN] etcd unavailable, running standalone: %v", err)
 	} else {
 		coordCtx, coordCancel := context.WithCancel(context.Background())
 		defer coordCancel()
-		assignedWindows := AssignShards(instanceID, 1, numWindows)
+		assignedWindows := AssignShards(instanceID, numInstances, numWindows)
 		if err := coord.Register(coordCtx, instanceID, assignedWindows); err != nil {
 			log.Printf("[WARN] coordinator register failed: %v", err)
 		} else {
@@ -56,8 +65,11 @@ func main() {
 	// Raw records channel (buffered to absorb bursts).
 	rawCh := make(chan QueueRecord, numWindows*10)
 
-	// Aggregated records channels — fan-out to all writers.
+	// Single aggregated channel from aggregator.
 	aggCh := make(chan AggregatedRecord, 200)
+
+	// Fan-out channels — each writer gets its own channel.
+	aggChWriter := make(chan AggregatedRecord, 200)
 	aggChArrow := make(chan AggregatedRecord, 200)
 	aggChNats := make(chan AggregatedRecord, 200)
 
@@ -71,12 +83,14 @@ func main() {
 	go runAggregator(aggregator, rawCh, aggCh, done)
 	log.Printf("[INFO] aggregator started: window=%s", windowDur)
 
-	// Fan-out: forward aggregated records to all writers.
+	// Fan-out: every record goes to ALL writers.
 	go func() {
 		for rec := range aggCh {
+			aggChWriter <- rec
 			aggChArrow <- rec
 			aggChNats <- rec
 		}
+		close(aggChWriter)
 		close(aggChArrow)
 		close(aggChNats)
 	}()
@@ -100,7 +114,7 @@ func main() {
 		go runNatsWriter(natsWriter, aggChNats, done)
 	}
 
-	// Start writer.
+	// Start NDJSON writer — reads from its own channel.
 	writer, err := NewWriter(outputDir, batchSize, flushInterval)
 	if err != nil {
 		log.Fatalf("[FATAL] writer init: %v", err)
@@ -109,7 +123,7 @@ func main() {
 		batchSize, flushInterval, outputDir)
 
 	// Writer runs in the main goroutine and blocks until done.
-	writer.Run(aggCh, done)
+	writer.Run(aggChWriter, done)
 
 	log.Println("[INFO] MFC collector stopped")
 }
