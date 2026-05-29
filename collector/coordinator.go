@@ -5,15 +5,21 @@ import (
 	"fmt"
 	"log"
 	"time"
-
+    "os"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
 const (
-	etcdEndpoint    = "localhost:2379"
 	etcdDialTimeout = 5 * time.Second
-	leaseTTL        = 10 // секунды
+	leaseTTL        = 10
 )
+
+func getEtcdEndpoint() string {
+	if ep := os.Getenv("ETCD_ENDPOINT"); ep != "" {
+		return ep
+	}
+	return "localhost:2379"
+}
 
 // Coordinator manages shard registration and discovery via etcd.
 type Coordinator struct {
@@ -25,7 +31,7 @@ type Coordinator struct {
 // NewCoordinator connects to etcd and returns a Coordinator.
 func NewCoordinator(instanceID int) (*Coordinator, error) {
 	client, err := clientv3.New(clientv3.Config{
-		Endpoints:   []string{etcdEndpoint},
+		Endpoints:   []string{getEtcdEndpoint()},
 		DialTimeout: etcdDialTimeout,
 	})
 	if err != nil {
