@@ -1,7 +1,7 @@
 package main
 
 import (
-    "context"
+	"context"
 	"log"
 	"os"
 	"os/signal"
@@ -34,8 +34,9 @@ func main() {
 		log.Printf("[INFO] received signal %s — shutting down gracefully", sig)
 		close(done)
 	}()
-// Coordinator: register this instance in etcd.
-	instanceID := 1 // в реальной системе берётся из env: os.Getenv("INSTANCE_ID")
+
+	// Coordinator: register this instance in etcd.
+	instanceID := 1
 	coord, err := NewCoordinator(instanceID)
 	if err != nil {
 		log.Printf("[WARN] etcd unavailable, running standalone: %v", err)
@@ -51,11 +52,13 @@ func main() {
 			log.Printf("[INFO] active instances: %v", instances)
 		}
 	}
+
 	// Raw records channel (buffered to absorb bursts).
 	rawCh := make(chan QueueRecord, numWindows*10)
 
-	// Aggregated records channel.
+	// Aggregated records channels — fan-out to Writer and ArrowWriter.
 	aggCh := make(chan AggregatedRecord, 200)
+	aggChArrow := make(chan AggregatedRecord, 200)
 
 	// Start emulator.
 	emulator := NewEmulator(numWindows, emitInterval)
@@ -66,6 +69,23 @@ func main() {
 	aggregator := NewAggregator(windowDur)
 	go runAggregator(aggregator, rawCh, aggCh, done)
 	log.Printf("[INFO] aggregator started: window=%s", windowDur)
+
+	// Fan-out: forward aggregated records to both writers.
+	go func() {
+		for rec := range aggCh {
+			aggChArrow <- rec
+		}
+		close(aggChArrow)
+	}()
+
+	// Arrow writer.
+	arrowWriter, arrowErr := NewArrowWriter(outputDir)
+	if arrowErr != nil {
+		log.Printf("[WARN] arrow writer init failed: %v", arrowErr)
+	} else {
+		log.Printf("[INFO] arrow writer started: output=%s", outputDir)
+		go runArrowWriter(arrowWriter, aggChArrow, done)
+	}
 
 	// Start writer.
 	writer, err := NewWriter(outputDir, batchSize, flushInterval)
@@ -87,7 +107,6 @@ func runAggregator(agg *Aggregator, in <-chan QueueRecord, out chan<- Aggregated
 	flushTicker := time.NewTicker(5 * time.Second)
 	defer func() {
 		flushTicker.Stop()
-		// Final flush before exit.
 		for _, rec := range agg.Flush(time.Now().Add(windowDur)) {
 			out <- rec
 		}
@@ -112,6 +131,42 @@ func runAggregator(agg *Aggregator, in <-chan QueueRecord, out chan<- Aggregated
 			}
 
 		case <-done:
+			return
+		}
+	}
+}
+
+// runArrowWriter buffers AggregatedRecords and writes them to Arrow IPC files.
+func runArrowWriter(aw *ArrowWriter, ch <-chan AggregatedRecord, done <-chan struct{}) {
+	var buf []AggregatedRecord
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		if err := aw.WriteBatch(buf); err != nil {
+			log.Printf("[ERROR] arrow flush: %v", err)
+		}
+		buf = nil
+	}
+
+	for {
+		select {
+		case rec, ok := <-ch:
+			if !ok {
+				flush()
+				return
+			}
+			buf = append(buf, rec)
+			if len(buf) >= batchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		case <-done:
+			flush()
 			return
 		}
 	}

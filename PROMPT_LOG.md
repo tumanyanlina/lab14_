@@ -1469,3 +1469,394 @@ func AssignShards(instanceID, numInstances, numWindows int) []int {
 	}
 	return assigned
 }
+
+Шаг 12 — П.3: Apache Arrow (задание 3 повышенного уровня)
+
+Промпт: Реализовать передачу данных через Apache Arrow IPC формат. Go: написать arrow_writer.go — ArrowWriter который пишет AggregatedRecord в .arrow файлы через github.com/apache/arrow/go/v17/arrow/ipc. Схема: window_id, service_type, avg/max/min_queue_length, avg/max_wait_time_sec, sample_count, window_start, window_end. В main.go добавить fan-out aggCh → aggChArrow, запустить ArrowWriter параллельно с обычным NDJSON Writer. Python: написать arrow_reader.py — читать .arrow файлы через pyarrow.ipc, конвертировать в Polars DataFrame через pl.from_arrow(). Сравнить с NDJSON: размер файлов и скорость чтения через time.perf_counter().
+
+Результат: arrow_writer.go, обновлённый main.go с fan-out,
+arrow_reader.py с функциями read_arrow_files(), read_ndjson_files(),
+compare_formats().
+
+arrow_writer.go:
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/apache/arrow/go/v17/arrow"
+	"github.com/apache/arrow/go/v17/arrow/array"
+	"github.com/apache/arrow/go/v17/arrow/ipc"
+	"github.com/apache/arrow/go/v17/arrow/memory"
+)
+
+// ArrowWriter writes AggregatedRecords to Apache Arrow IPC files.
+type ArrowWriter struct {
+	outputDir string
+	fileSeq   int
+}
+
+// NewArrowWriter creates an ArrowWriter that stores .arrow files in outputDir.
+func NewArrowWriter(outputDir string) (*ArrowWriter, error) {
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create arrow output dir: %w", err)
+	}
+	return &ArrowWriter{outputDir: outputDir}, nil
+}
+
+// schema returns the Arrow schema for AggregatedRecord.
+func arrowSchema() *arrow.Schema {
+	return arrow.NewSchema([]arrow.Field{
+		{Name: "window_id", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "service_type", Type: arrow.BinaryTypes.String},
+		{Name: "avg_queue_length", Type: arrow.PrimitiveTypes.Float64},
+		{Name: "max_queue_length", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "min_queue_length", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "avg_wait_time_sec", Type: arrow.PrimitiveTypes.Float64},
+		{Name: "max_wait_time_sec", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "sample_count", Type: arrow.PrimitiveTypes.Int64},
+		{Name: "window_start", Type: arrow.PrimitiveTypes.Int64}, // unix seconds
+		{Name: "window_end", Type: arrow.PrimitiveTypes.Int64},
+	}, nil)
+}
+
+// WriteBatch writes a slice of AggregatedRecords to a new .arrow file.
+func (w *ArrowWriter) WriteBatch(records []AggregatedRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+
+	w.fileSeq++
+	filename := filepath.Join(
+		w.outputDir,
+		fmt.Sprintf("mfc_%s_%04d.arrow",
+			time.Now().Format("20060102_150405"), w.fileSeq),
+	)
+
+	f, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("create arrow file: %w", err)
+	}
+	defer f.Close()
+
+	schema := arrowSchema()
+	pool := memory.NewGoAllocator()
+
+	// Build columns.
+	b0 := array.NewInt64Builder(pool)
+	b1 := array.NewStringBuilder(pool)
+	b2 := array.NewFloat64Builder(pool)
+	b3 := array.NewInt64Builder(pool)
+	b4 := array.NewInt64Builder(pool)
+	b5 := array.NewFloat64Builder(pool)
+	b6 := array.NewInt64Builder(pool)
+	b7 := array.NewInt64Builder(pool)
+	b8 := array.NewInt64Builder(pool)
+	b9 := array.NewInt64Builder(pool)
+
+	for _, r := range records {
+		b0.Append(int64(r.WindowID))
+		b1.Append(string(r.ServiceType))
+		b2.Append(r.AvgQueueLength)
+		b3.Append(int64(r.MaxQueueLength))
+		b4.Append(int64(r.MinQueueLength))
+		b5.Append(r.AvgWaitTimeSec)
+		b6.Append(int64(r.MaxWaitTimeSec))
+		b7.Append(int64(r.SampleCount))
+		b8.Append(r.WindowStart.Unix())
+		b9.Append(r.WindowEnd.Unix())
+	}
+
+	rec := array.NewRecord(schema, []arrow.Array{
+		b0.NewArray(), b1.NewArray(), b2.NewArray(),
+		b3.NewArray(), b4.NewArray(), b5.NewArray(),
+		b6.NewArray(), b7.NewArray(), b8.NewArray(),
+		b9.NewArray(),
+	}, int64(len(records)))
+	defer rec.Release()
+
+	writer, err := ipc.NewFileWriter(f, ipc.WithSchema(schema))
+if err != nil {
+    return fmt.Errorf("create arrow file writer: %w", err)
+}
+	if err := writer.Write(rec); err != nil {
+		return fmt.Errorf("write arrow record: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return fmt.Errorf("close arrow writer: %w", err)
+	}
+
+	log.Printf("[INFO] arrow: wrote %d records → %s", len(records), filename)
+	return nil
+}
+
+arrow-reader.py:
+import glob
+import time
+from pathlib import Path
+
+import pyarrow as pa
+import pyarrow.ipc as ipc
+import polars as pl
+
+
+DATA_DIR = Path(__file__).parent.parent / "data"
+
+
+def read_arrow_files() -> pl.DataFrame:
+    """Read all .arrow files into a single Polars DataFrame."""
+    files = sorted(glob.glob(str(DATA_DIR / "*.arrow")))
+    if not files:
+        raise FileNotFoundError(f"No .arrow files found in {DATA_DIR}")
+
+    print(f"[INFO] найдено {len(files)} .arrow файлов")
+
+    tables = []
+    for f in files:
+        with pa.memory_map(f, "r") as source:
+            reader = ipc.open_file(source)
+            tables.append(reader.read_all())
+
+    combined = pa.concat_tables(tables)
+    df = pl.from_arrow(combined)
+    print(f"[INFO] загружено {df.height} строк из Arrow")
+    return df
+
+
+def read_ndjson_files() -> pl.DataFrame:
+    """Read all .ndjson files into a single Polars DataFrame."""
+    files = sorted(glob.glob(str(DATA_DIR / "*.ndjson")))
+    if not files:
+        raise FileNotFoundError(f"No .ndjson files found in {DATA_DIR}")
+
+    print(f"[INFO] найдено {len(files)} .ndjson файлов")
+    frames = [pl.read_ndjson(f) for f in files]
+    df = pl.concat(frames)
+    print(f"[INFO] загружено {df.height} строк из NDJSON")
+    return df
+
+
+def compare_formats() -> None:
+    """Compare Arrow vs NDJSON: file size and read speed."""
+    print("\n=== Сравнение форматов: Arrow vs NDJSON ===")
+
+    # File sizes.
+    arrow_files = glob.glob(str(DATA_DIR / "*.arrow"))
+    ndjson_files = glob.glob(str(DATA_DIR / "*.ndjson"))
+
+    arrow_size = sum(Path(f).stat().st_size for f in arrow_files)
+    ndjson_size = sum(Path(f).stat().st_size for f in ndjson_files)
+
+    print(f"\nРазмер файлов:")
+    print(f"  Arrow  : {arrow_size:,} байт  ({len(arrow_files)} файлов)")
+    print(f"  NDJSON : {ndjson_size:,} байт  ({len(ndjson_files)} файлов)")
+    if ndjson_size > 0:
+        ratio = ndjson_size / arrow_size if arrow_size > 0 else 0
+        print(f"  NDJSON / Arrow = {ratio:.2f}x")
+
+    # Read speed.
+    print(f"\nСкорость чтения:")
+
+    t0 = time.perf_counter()
+    df_arrow = read_arrow_files()
+    arrow_time = time.perf_counter() - t0
+    print(f"  Arrow  : {arrow_time * 1000:.2f} ms ({df_arrow.height} строк)")
+
+    t0 = time.perf_counter()
+    df_ndjson = read_ndjson_files()
+    ndjson_time = time.perf_counter() - t0
+    print(f"  NDJSON : {ndjson_time * 1000:.2f} ms ({df_ndjson.height} строк)")
+
+    faster = "Arrow" if arrow_time < ndjson_time else "NDJSON"
+    ratio = max(arrow_time, ndjson_time) / min(arrow_time, ndjson_time)
+    print(f"\n  Быстрее: {faster} (в {ratio:.1f}x)")
+
+    print("\n--- Arrow DataFrame (первые 5 строк) ---")
+    print(df_arrow.head(5))
+
+
+def main() -> None:
+    compare_formats()
+
+
+if __name__ == "__main__":
+    main()
+
+main.go:
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+)
+
+const (
+	numWindows    = 8
+	emitInterval  = 2 * time.Second
+	windowDur     = 30 * time.Second
+	batchSize     = 20
+	flushInterval = 15 * time.Second
+	outputDir     = "../data"
+)
+
+func main() {
+	log.SetFlags(log.Ldate | log.Ltime)
+	log.Println("[INFO] MFC collector starting")
+	log.Printf("[INFO] windows=%d, emit_interval=%s, tumbling_window=%s",
+		numWindows, emitInterval, windowDur)
+
+	// Graceful shutdown: listen for SIGINT / SIGTERM.
+	done := make(chan struct{})
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		sig := <-sigCh
+		log.Printf("[INFO] received signal %s — shutting down gracefully", sig)
+		close(done)
+	}()
+
+	// Coordinator: register this instance in etcd.
+	instanceID := 1
+	coord, err := NewCoordinator(instanceID)
+	if err != nil {
+		log.Printf("[WARN] etcd unavailable, running standalone: %v", err)
+	} else {
+		coordCtx, coordCancel := context.WithCancel(context.Background())
+		defer coordCancel()
+		assignedWindows := AssignShards(instanceID, 1, numWindows)
+		if err := coord.Register(coordCtx, instanceID, assignedWindows); err != nil {
+			log.Printf("[WARN] coordinator register failed: %v", err)
+		} else {
+			defer coord.Deregister(coordCtx)
+			instances, _ := coord.ListInstances(coordCtx)
+			log.Printf("[INFO] active instances: %v", instances)
+		}
+	}
+
+	// Raw records channel (buffered to absorb bursts).
+	rawCh := make(chan QueueRecord, numWindows*10)
+
+	// Aggregated records channels — fan-out to Writer and ArrowWriter.
+	aggCh := make(chan AggregatedRecord, 200)
+	aggChArrow := make(chan AggregatedRecord, 200)
+
+	// Start emulator.
+	emulator := NewEmulator(numWindows, emitInterval)
+	go emulator.Run(rawCh, done)
+	log.Printf("[INFO] emulator started: %d windows", numWindows)
+
+	// Start aggregator loop.
+	aggregator := NewAggregator(windowDur)
+	go runAggregator(aggregator, rawCh, aggCh, done)
+	log.Printf("[INFO] aggregator started: window=%s", windowDur)
+
+	// Fan-out: forward aggregated records to both writers.
+	go func() {
+		for rec := range aggCh {
+			aggChArrow <- rec
+		}
+		close(aggChArrow)
+	}()
+
+	// Arrow writer.
+	arrowWriter, arrowErr := NewArrowWriter(outputDir)
+	if arrowErr != nil {
+		log.Printf("[WARN] arrow writer init failed: %v", arrowErr)
+	} else {
+		log.Printf("[INFO] arrow writer started: output=%s", outputDir)
+		go runArrowWriter(arrowWriter, aggChArrow, done)
+	}
+
+	// Start writer.
+	writer, err := NewWriter(outputDir, batchSize, flushInterval)
+	if err != nil {
+		log.Fatalf("[FATAL] writer init: %v", err)
+	}
+	log.Printf("[INFO] writer started: batch=%d, flush_interval=%s, output=%s",
+		batchSize, flushInterval, outputDir)
+
+	// Writer runs in the main goroutine and blocks until done.
+	writer.Run(aggCh, done)
+
+	log.Println("[INFO] MFC collector stopped")
+}
+
+// runAggregator reads raw records, feeds them into the aggregator,
+// and periodically flushes completed windows into aggCh.
+func runAggregator(agg *Aggregator, in <-chan QueueRecord, out chan<- AggregatedRecord, done <-chan struct{}) {
+	flushTicker := time.NewTicker(5 * time.Second)
+	defer func() {
+		flushTicker.Stop()
+		for _, rec := range agg.Flush(time.Now().Add(windowDur)) {
+			out <- rec
+		}
+		close(out)
+		log.Println("[INFO] aggregator stopped")
+	}()
+
+	for {
+		select {
+		case rec, ok := <-in:
+			if !ok {
+				return
+			}
+			agg.Add(rec)
+
+		case t := <-flushTicker.C:
+			flushed := agg.Flush(t)
+			for _, rec := range flushed {
+				out <- rec
+				log.Printf("[INFO] window flushed: window_id=%d service=%s avg_queue=%.1f samples=%d",
+					rec.WindowID, rec.ServiceType, rec.AvgQueueLength, rec.SampleCount)
+			}
+
+		case <-done:
+			return
+		}
+	}
+}
+
+// runArrowWriter buffers AggregatedRecords and writes them to Arrow IPC files.
+func runArrowWriter(aw *ArrowWriter, ch <-chan AggregatedRecord, done <-chan struct{}) {
+	var buf []AggregatedRecord
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		if err := aw.WriteBatch(buf); err != nil {
+			log.Printf("[ERROR] arrow flush: %v", err)
+		}
+		buf = nil
+	}
+
+	for {
+		select {
+		case rec, ok := <-ch:
+			if !ok {
+				flush()
+				return
+			}
+			buf = append(buf, rec)
+			if len(buf) >= batchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		case <-done:
+			flush()
+			return
+		}
+	}
+}
