@@ -1,9 +1,3 @@
-"""
-aggregate.py — Задания 6, 7, 8
-Агрегационный анализ через Polars + DuckDB.
-Замер производительности обоих движков.
-"""
-
 import time
 from pathlib import Path
 
@@ -21,10 +15,6 @@ def load_parquet() -> pl.DataFrame:
         )
     return pl.read_parquet(PARQUET_PATH)
 
-
-# ---------------------------------------------------------------------------
-# Задание 6 — агрегационный анализ (Polars)
-# ---------------------------------------------------------------------------
 
 def analyze_by_service(df: pl.DataFrame) -> pl.DataFrame:
     """Группировка по типу услуги: среднее, макс, мин очереди."""
@@ -68,11 +58,6 @@ def analyze_by_hour(df: pl.DataFrame) -> pl.DataFrame:
         ])
         .sort("hour")
     )
-
-
-# ---------------------------------------------------------------------------
-# Задание 8 — DuckDB SQL-анализ + сравнение производительности
-# ---------------------------------------------------------------------------
 
 def run_duckdb() -> pl.DataFrame:
     query = f"""
@@ -135,7 +120,6 @@ def main() -> None:
 
     benchmark(df)
 
-    # Сохранить агрегаты для дашборда.
     out_dir = Path(__file__).parent.parent / "data"
     by_service.write_parquet(out_dir / "agg_by_service.parquet")
     by_window.write_parquet(out_dir / "agg_by_window.parquet")
