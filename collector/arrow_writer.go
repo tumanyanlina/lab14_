@@ -99,9 +99,9 @@ func (w *ArrowWriter) WriteBatch(records []AggregatedRecord) error {
 	defer rec.Release()
 
 	writer, err := ipc.NewFileWriter(f, ipc.WithSchema(schema))
-if err != nil {
-    return fmt.Errorf("create arrow file writer: %w", err)
-}
+	if err != nil {
+		return fmt.Errorf("create arrow file writer: %w", err)
+	}
 	if err := writer.Write(rec); err != nil {
 		return fmt.Errorf("write arrow record: %w", err)
 	}

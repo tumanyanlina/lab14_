@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
-	"time"
-    "os"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"log"
+	"os"
+	"time"
 )
 
 const (
