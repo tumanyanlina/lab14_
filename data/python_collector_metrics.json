@@ -1,0 +1,10 @@
+{
+  "duration_sec": 60.24,
+  "records_raw": 240,
+  "records_agg": 16,
+  "throughput_rps": 3.98,
+  "cpu_user_sec": 0.0,
+  "cpu_sys_sec": 0.0,
+  "mem_delta_mb": 0.08,
+  "mem_peak_mb": 25.2
+}
