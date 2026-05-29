@@ -8,3 +8,10 @@ services:
     ports:
       - "2379:2379"
       - "2380:2380"
+
+  nats:
+    image: nats:2.10-alpine
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["--jetstream", "--http_port", "8222"]
