@@ -2396,3 +2396,281 @@ services:
       - "4222:4222"
       - "8222:8222"
     command: ["--jetstream", "--http_port", "8222"]
+
+Шаг 15 — П.4: Rust-библиотека для валидации (PyO3)
+
+Промпт: Написать на Rust библиотеку валидации данных МФЦ через PyO3.
+Функции: 
+- validate_queue_record() — валидация одной записи: window_id в [1, 100], queue lengths >= 0, min <= avg <= max, wait_time >= 0, sample_count >= 1, service_type из списка допустимых
+- validate_batch() — батч валидация, возвращает список (index, error)
+Собрать через maturin develop, интегрировать в Python-скрипт validate_with_rust.py который читает mfc_clean.parquet и валидирует все записи через Rust.
+
+Результат: Создан validator/src/lib.rs, validator/Cargo.toml,
+validator/test_validator.py, analysis/validate_with_rust.py.
+
+lib.rs:
+use pyo3::prelude::*;
+
+/// Validates a single MFC queue record.
+/// Returns Ok(()) if valid, Err(String) with reason if invalid.
+fn validate_record(
+    window_id: i64,
+    avg_queue_length: f64,
+    max_queue_length: f64,
+    min_queue_length: f64,
+    avg_wait_time_sec: f64,
+    sample_count: i64,
+    service_type: &str,
+) -> Result<(), String> {
+    // window_id must be between 1 and 100.
+    if window_id < 1 || window_id > 100 {
+        return Err(format!("window_id {} out of range [1, 100]", window_id));
+    }
+
+    // Queue lengths must be non-negative.
+    if avg_queue_length < 0.0 {
+        return Err(format!("avg_queue_length {} is negative", avg_queue_length));
+    }
+    if max_queue_length < 0.0 {
+        return Err(format!("max_queue_length {} is negative", max_queue_length));
+    }
+    if min_queue_length < 0.0 {
+        return Err(format!("min_queue_length {} is negative", min_queue_length));
+    }
+
+    // min must not exceed max.
+    if min_queue_length > max_queue_length {
+        return Err(format!(
+            "min_queue_length {} > max_queue_length {}",
+            min_queue_length, max_queue_length
+        ));
+    }
+
+    // avg must be between min and max.
+    if avg_queue_length < min_queue_length || avg_queue_length > max_queue_length {
+        return Err(format!(
+            "avg_queue_length {} not in [{}, {}]",
+            avg_queue_length, min_queue_length, max_queue_length
+        ));
+    }
+
+    // Wait time must be non-negative.
+    if avg_wait_time_sec < 0.0 {
+        return Err(format!("avg_wait_time_sec {} is negative", avg_wait_time_sec));
+    }
+
+    // Sample count must be positive.
+    if sample_count < 1 {
+        return Err(format!("sample_count {} must be >= 1", sample_count));
+    }
+
+    // service_type must be one of the known values.
+    let valid_services = [
+        "passport",
+        "registration",
+        "social_benefit",
+        "tax",
+        "property",
+    ];
+    if !valid_services.contains(&service_type) {
+        return Err(format!("unknown service_type: {}", service_type));
+    }
+
+    Ok(())
+}
+
+/// Python-callable: validate one record, return (is_valid, error_message).
+#[pyfunction]
+fn validate_queue_record(
+    window_id: i64,
+    avg_queue_length: f64,
+    max_queue_length: f64,
+    min_queue_length: f64,
+    avg_wait_time_sec: f64,
+    sample_count: i64,
+    service_type: &str,
+) -> PyResult<(bool, String)> {
+    match validate_record(
+        window_id,
+        avg_queue_length,
+        max_queue_length,
+        min_queue_length,
+        avg_wait_time_sec,
+        sample_count,
+        service_type,
+    ) {
+        Ok(()) => Ok((true, String::new())),
+        Err(msg) => Ok((false, msg)),
+    }
+}
+
+/// Python-callable: validate a batch of records.
+/// Returns list of (row_index, error_message) for invalid records.
+#[pyfunction]
+fn validate_batch(records: Vec<(i64, f64, f64, f64, f64, i64, String)>) -> PyResult<Vec<(usize, String)>> {
+    let mut errors = Vec::new();
+    for (i, (window_id, avg_q, max_q, min_q, avg_w, samples, svc)) in records.iter().enumerate() {
+        if let Err(msg) = validate_record(*window_id, *avg_q, *max_q, *min_q, *avg_w, *samples, svc) {
+            errors.push((i, msg));
+        }
+    }
+    Ok(errors)
+}
+
+#[pymodule]
+fn mfc_validator(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(validate_queue_record, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_batch, m)?)?;
+    Ok(())
+}
+
+Cargo.toml:
+[package]
+name = "mfc_validator"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mfc_validator"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py38"] }
+
+test_validator.py:
+import mfc_validator
+
+# Тест 1: валидная запись
+ok, err = mfc_validator.validate_queue_record(
+    window_id=1,
+    avg_queue_length=4.5,
+    max_queue_length=7.0,
+    min_queue_length=2.0,
+    avg_wait_time_sec=1080.0,
+    sample_count=15,
+    service_type="passport",
+)
+print(f"Тест 1 (валидная): ok={ok}, err='{err}'")
+
+# Тест 2: отрицательная очередь
+ok, err = mfc_validator.validate_queue_record(
+    window_id=1,
+    avg_queue_length=-1.0,
+    max_queue_length=7.0,
+    min_queue_length=-2.0,
+    avg_wait_time_sec=1080.0,
+    sample_count=15,
+    service_type="passport",
+)
+print(f"Тест 2 (негативная очередь): ok={ok}, err='{err}'")
+
+# Тест 3: неизвестный тип услуги
+ok, err = mfc_validator.validate_queue_record(
+    window_id=1,
+    avg_queue_length=4.5,
+    max_queue_length=7.0,
+    min_queue_length=2.0,
+    avg_wait_time_sec=1080.0,
+    sample_count=15,
+    service_type="unknown_service",
+)
+print(f"Тест 3 (неизвестный сервис): ok={ok}, err='{err}'")
+
+# Тест 4: avg > max
+ok, err = mfc_validator.validate_queue_record(
+    window_id=1,
+    avg_queue_length=10.0,
+    max_queue_length=7.0,
+    min_queue_length=2.0,
+    avg_wait_time_sec=1080.0,
+    sample_count=15,
+    service_type="tax",
+)
+print(f"Тест 4 (avg > max): ok={ok}, err='{err}'")
+
+# Тест 5: батч валидация
+batch = [
+    (1, 4.5, 7.0, 2.0, 1080.0, 15, "passport"),
+    (2, -1.0, 5.0, -2.0, 500.0, 10, "tax"),
+    (3, 3.0, 6.0, 1.0, 720.0, 12, "unknown"),
+]
+errors = mfc_validator.validate_batch(batch)
+print(f"\nТест 5 (батч из 3, ошибок={len(errors)}):")
+for idx, msg in errors:
+    print(f"  строка {idx}: {msg}")
+
+validate_with_rust.py:
+"""
+validate_with_rust.py — П.4: Интеграция Rust-библиотеки для валидации
+Использует mfc_validator (Rust/PyO3) для валидации данных из Parquet.
+"""
+
+import sys
+from pathlib import Path
+
+import polars as pl
+
+# Добавляем путь к Rust-библиотеке.
+sys.path.insert(0, str(Path(__file__).parent.parent / "validator" / ".venv" / "Lib" / "site-packages"))
+import mfc_validator
+
+
+DATA_DIR = Path(__file__).parent.parent / "data"
+PARQUET_PATH = DATA_DIR / "mfc_clean.parquet"
+
+
+def validate_dataframe(df: pl.DataFrame) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """
+    Validate all records using Rust mfc_validator.
+    Returns (valid_df, invalid_df).
+    """
+    records = [
+        (
+            int(row["window_id"]),
+            float(row["avg_queue_length"]),
+            float(row["max_queue_length"]),
+            float(row["min_queue_length"]),
+            float(row["avg_wait_time_sec"]),
+            int(row["sample_count"]),
+            str(row["service_type"]),
+        )
+        for row in df.iter_rows(named=True)
+    ]
+
+    errors = mfc_validator.validate_batch(records)
+    error_indices = {idx for idx, _ in errors}
+
+    valid_mask = [i not in error_indices for i in range(len(records))]
+    invalid_mask = [i in error_indices for i in range(len(records))]
+
+    valid_df = df.filter(pl.Series(valid_mask))
+    invalid_df = df.filter(pl.Series(invalid_mask))
+
+    return valid_df, invalid_df
+
+
+def main() -> None:
+    print("[INFO] загружаем данные из Parquet...")
+    df = pl.read_parquet(PARQUET_PATH)
+    print(f"[INFO] загружено {df.height} строк")
+
+    print("\n[INFO] валидация через Rust (mfc_validator)...")
+    valid_df, invalid_df = validate_dataframe(df)
+
+    print(f"\n=== Результаты валидации ===")
+    print(f"  Всего записей : {df.height}")
+    print(f"  Валидных      : {valid_df.height}")
+    print(f"  Невалидных    : {invalid_df.height}")
+
+    if invalid_df.height > 0:
+        print("\n--- Невалидные записи ---")
+        print(invalid_df)
+    else:
+        print("\n✓ Все записи прошли валидацию!")
+
+    print("\n--- Валидные записи (первые 5) ---")
+    print(valid_df.head(5))
+
+
+if __name__ == "__main__":
+    main()
